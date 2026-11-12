@@ -80,8 +80,9 @@ def assess_fit(fit, centers):
     curve_z = design_matrix(curve_x, fit['c'], fit['width']) @ fit['beta'] # world z in cm
     return (curve_x, curve_z)
 
-def boundary_candidates(cloud, road_id, sidewalk_id, n=30, radius=0.3, min_spacing=5.0, max_road_pts=200_000):
-    random_gen = np.random.default_rng()
+def boundary_candidates(cloud, road_id, sidewalk_id, n=30, radius=0.3, min_spacing=5.0, max_road_pts=200_000, seed=None):
+    # seed=None keeps the old (random every run) behaviour; pass an int for reproducible runs
+    random_gen = np.random.default_rng(seed)
 
     xyz = cloud["xyz"][:, :2]
     semantic = cloud["semantic"]
@@ -120,10 +121,14 @@ def boundary_estimator(cloud, center_xy, road_id, sidewalk_id, window_width=6.0,
 
     road = point_coords[semantic[idx] == road_id]
     side = point_coords[semantic[idx] == sidewalk_id]
+    if len(road) == 0 or len(side) == 0:  # guard: nothing to fit
+        return None
 
     # label-edge points - road points that are within a radius of the sidewalk points
     dist, _ = cKDTree(side).query(road, distance_upper_bound=edge_radius)
     edge = road[np.isfinite(dist)]
+    if len(edge) < 3:  # guard: PCA needs a few edge points
+        return None
 
     # PCA - want the largest variance to be our boundary
     across, along, mean, normal = pca(edge, road, side, point_coords)
@@ -152,14 +157,18 @@ def boundary_estimator(cloud, center_xy, road_id, sidewalk_id, window_width=6.0,
     max_width = min(1.0, (centers.max() - centers.min()) / 2)
     widths = np.arange(2 * bin_w, max_width + 1e-9, 2 * bin_w)
 
-    fit = try_fit(widths, centers, meds, cnt)    
+    fit = try_fit(widths, centers, meds, cnt)
+    if fit is None:  # guard: fewer than 7 usable bins, try_fit never ran
+        return None
     step_cm = fit['beta'][2] * 100  # signed offset at the transition midpoint
 
     return dict(center=center_xy, mean=mean, normal=normal, pts=boundary_pt_pos,
                 z=height, lab=label, bins=(centers, meds),
                 s_step=fit['c'], step_cm=step_cm, sidewalk_slope=fit['beta'][3],
-                ramp_width_cm=fit['width'] * 100, 
-                fit_curve=assess_fit(fit, centers))
+                ramp_width_cm=fit['width'] * 100,
+                fit_curve=assess_fit(fit, centers),
+                fit=fit,                # NEW: c, width, beta, mse -> needed to rebuild the profile
+                point_idx=idx[along])   # NEW: indices (into the cloud passed in) of pts/z/lab, same order
 
 def get_curb_side(res, cam_to_world, proj_matrix):
     z = np.median(res["z"])
