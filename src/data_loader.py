@@ -47,6 +47,9 @@ def load_ply(path):
     return out
 
 def load_cloud_for_frame(chunks, frame):
+    matched = get_chunks_for_frame(chunks, frame)
+    if not matched:
+        raise ValueError(f"No static point cloud chunks cover frame {frame} (total chunks: {len(chunks)})")
     parts = [load_ply(c[2]) for c in get_chunks_for_frame(chunks, frame)]
     keys = set.intersection(*[set(p) for p in parts])
     return {k: np.concatenate([p[k] for p in parts]) for k in keys}
