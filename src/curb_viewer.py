@@ -1,0 +1,912 @@
+"""
+Interactive viewer for one frame's curb slices (the .npz written by results_io.save_frame_results).
+
+    pip install viser plotly
+    python curb_viewer.py ../outputs/slices                      # every frame in the folder
+    python curb_viewer.py ../outputs/slices/<file>.npz [more.npz]  # specific files
+    -> open http://localhost:8080   (with several files, pick one in the "Frame" dropdown)
+
+Controls (click the 3D view first so the page has focus; press ? in the viewer for this list)
+  ← / →                    previous / next slice
+  shift + ← / →, [ / ]     previous / next frame (the view follows the car, or stays fixed if locked)
+  L                        lock / unlock the camera between frames
+  Tab                      curb side: Both -> Left -> Right
+  F / C / Home             focus selected slice / view from camera / re-centre on this frame
+  Esc                      clear the picked point (or close the help window)
+  click an orb or ribbon   select that slice
+  shift + click            pick any LiDAR point in 3D -> marked in 3D and in the photo, with its height above road
+  mouse / WASD / QE / ↑↓   move the 3D camera (viser defaults)
+
+3D view
+  * points are coloured by height above the local road surface (or by road/sidewalk label),
+  * each slice has a "curb ribbon": its fitted profile extruded along the curb, with the bottom
+    and top edges of the curb drawn as lines. Length and margin are adjustable ("Curb ribbons"),
+    or the ribbon can span the along-curb range the slice's points actually cover,
+  * the same ribbons and edges are drawn on the photo, so you can match 3D and image.
+
+The side panel is docked on the right (drag its edge to resize; --panel-width sets the start width).
+
+Coordinates: the 3D scene is world XYZ shifted by a local origin (the slices' mean), in metres.
+"Vertical exaggeration" only scales the 3D view; numbers in the panels are always true values.
+"""
+import argparse
+import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import matplotlib
+import numpy as np
+import plotly.graph_objects as go
+import viser
+import viser.transforms as vtf
+from PIL import Image, ImageDraw
+from scipy.spatial import cKDTree
+
+import analyze_boundary
+import results_io
+
+# ----------------------------------------------------------------------------- colours
+ROAD_RGB = np.array([70, 110, 200])
+SIDE_RGB = np.array([215, 90, 80])
+SIDE_COLOR = {"left": (0, 160, 255), "right": (255, 120, 0), "unknown": (160, 160, 160)}
+SELECTED = (235, 0, 210)      # magenta
+PICK = (60, 255, 60)          # picked point
+OUTLINE = (0, 0, 0)
+
+HEIGHT_RANGE = (-0.03, 0.22)  # m, colour scale for "height above road"
+HEIGHT_CMAP = matplotlib.colormaps["viridis"]
+
+RIBBON_LENGTH = 1.0           # m along the curb (default; adjustable in the GUI)
+RIBBON_MARGIN = 0.4           # m of road / sidewalk shown each side of the ramp (adjustable)
+ORB_FACTOR = 1.0              # curb-centre orb radius = ORB_FACTOR x point size
+ORB_MIN_RADIUS = 0.015        # m, so the orbs stay clickable
+LIFT = np.array([0, 0, 0.02])  # 3D only: draw ribbons/lines 2 cm above the points so they aren't hidden
+
+
+def hexc(rgb):
+    return "#%02x%02x%02x" % tuple(int(c) for c in rgb)
+
+
+def label_colors(lab, road_id, scale=1.0):
+    c = np.where((lab == road_id)[:, None], ROAD_RGB, SIDE_RGB) * scale
+    return np.clip(c, 0, 255).astype(np.uint8)
+
+
+def height_colors(h):
+    t = (np.clip(h, *HEIGHT_RANGE) - HEIGHT_RANGE[0]) / (HEIGHT_RANGE[1] - HEIGHT_RANGE[0])
+    return (HEIGHT_CMAP(t)[:, :3] * 255).astype(np.uint8)
+
+
+# ----------------------------------------------------------------------------- data
+class Frame:
+    """Everything the viewer needs, pre-computed once."""
+
+    def __init__(self, npz_path):
+        self.path = Path(npz_path)
+        self.meta, self.slices = results_io.load_frame_results(self.path)
+        m = self.meta
+        self.road_id = int(m["road_id"])
+        self.c2w = np.asarray(m["cam_to_world"], float)
+        self.P = np.asarray(m["proj_matrix"], float)
+        self.K = len(self.slices)
+        if self.K == 0:
+            raise SystemExit("No slices in this file.")
+
+        img_path = Path(str(m["image_path"]))
+        if img_path.exists():
+            self.img = np.asarray(Image.open(img_path).convert("RGB"))
+        else:
+            print(f"WARNING: image not found at {img_path}; using a blank image")
+            self.img = np.full((376, 1408, 3), 40, np.uint8)
+        self.H, self.W = self.img.shape[:2]
+
+        anchors = np.array([s["anchor_3d"] for s in self.slices])
+        self.center = np.r_[anchors[:, :2].mean(0), np.median(anchors[:, 2])]  # middle of this frame's slices
+        # 3D coordinates are world - origin. The viewer replaces this with one origin shared by all
+        # frames of the same drive, so the camera does not jump when switching frames.
+        self.origin = self.center.copy()
+
+        self.ribbon_length, self.ribbon_margin, self.ribbon_data_extent = RIBBON_LENGTH, RIBBON_MARGIN, False
+
+        self.ctx_xyz = np.asarray(m["context_xyz"], float)
+        self.ctx_lab = np.asarray(m["context_lab"])
+        self._build_road_level()
+        self.ctx_h = self.height_above_road(self.ctx_xyz)
+
+        for s in self.slices:
+            s["h"] = self.height_above_road(s["xyz"])
+            s["uv_pts"] = self.to_uv(s["xyz"])
+            s["uv_curve"] = self.to_uv(s["curve_xyz"])
+            s["uv_anchor"] = self.to_uv(s["anchor_3d"][None])[0]
+            self._build_ribbon(s)
+
+    # --- geometry helpers
+    def local(self, xyz):
+        return np.asarray(xyz, float) - self.origin
+
+    def to_uv(self, xyz):
+        return results_io._to_image(np.asarray(xyz, float), self.c2w, self.P)
+
+    def _build_road_level(self, cell=1.0, k=6):
+        """Road surface height: median z of road points per 1 m cell, IDW-interpolated."""
+        road = self.ctx_xyz[self.ctx_lab == self.road_id]
+        if len(road) < 10:  # fall back to all context points
+            road = self.ctx_xyz
+        ij = np.floor(road[:, :2] / cell).astype(np.int64)
+        cells, inv = np.unique(ij, axis=0, return_inverse=True)
+        inv = inv.ravel()
+        order = np.argsort(inv)
+        splits = np.split(road[order, 2], np.cumsum(np.bincount(inv))[:-1])
+        keep = np.array([len(z) >= 3 for z in splits])
+        self._cell_xy = (cells[keep] + 0.5) * cell
+        self._cell_z = np.array([np.median(z) for z, ok in zip(splits, keep) if ok])
+        self._cell_tree = cKDTree(self._cell_xy)
+        self._k = min(k, len(self._cell_xy))
+
+    def road_level(self, xy):
+        d, i = self._cell_tree.query(np.atleast_2d(xy), k=self._k)
+        d, i = np.atleast_2d(d).reshape(len(xy), -1), np.atleast_2d(i).reshape(len(xy), -1)
+        w = 1.0 / np.maximum(d, 0.05) ** 2
+        return (w * self._cell_z[i]).sum(1) / w.sum(1)
+
+    def height_above_road(self, xyz):
+        xyz = np.atleast_2d(xyz)
+        return xyz[:, 2] - self.road_level(xyz[:, :2])
+
+    def set_ribbon_params(self, length=None, margin=None, data_extent=None):
+        if length is not None:
+            self.ribbon_length = float(length)
+        if margin is not None:
+            self.ribbon_margin = float(margin)
+        if data_extent is not None:
+            self.ribbon_data_extent = bool(data_extent)
+        for s in self.slices:
+            self._build_ribbon(s)
+
+    def _build_ribbon(self, s, n=40):
+        """Fitted profile extruded along the curb.
+
+        Across the curb: the fitted ramp (c +- w/2) plus `ribbon_margin` of road/sidewalk.
+        Along the curb: `ribbon_length` centred on the slice line, or (data extent mode)
+        the along-curb range actually covered by the slice's points (2nd-98th percentile).
+        """
+        fit = s["fit"]
+        c, w, beta = fit["c"], fit["width"], fit["beta"]
+        lo = max(c - w / 2 - self.ribbon_margin, s["s"].min())
+        hi = min(c + w / 2 + self.ribbon_margin, s["s"].max())
+        # always include the ramp's start/end exactly, otherwise the corners get cut and the step looks
+        # slanted (the wider the margin, the coarser the sampling, the worse it got)
+        kinks = np.array([c - w / 2, c + w / 2])
+        ss = np.unique(np.r_[np.linspace(lo, hi, n), kinks[(kinks > lo) & (kinks < hi)]])
+        n = len(ss)
+        zz = analyze_boundary.design_matrix(ss, c, w) @ beta
+        nrm = np.asarray(s["normal"], float)
+        tan = np.array([-nrm[1], nrm[0]])
+        if self.ribbon_data_extent:
+            along = (s["xyz"][:, :2] - np.asarray(s["mean"])) @ tan
+            a0, a1 = np.percentile(along, [2, 98])
+        else:
+            a0, a1 = -self.ribbon_length / 2, self.ribbon_length / 2
+        s["ribbon_along"] = (a0, a1)
+        base = np.asarray(s["mean"], float) + ss[:, None] * nrm
+        A = np.column_stack((base + a0 * tan, zz))
+        B = np.column_stack((base + a1 * tan, zz))
+        s["ribbon_verts"] = np.vstack((A, B))
+        f = [(i, i + 1, n + i) for i in range(n - 1)] + [(i + 1, n + i + 1, n + i) for i in range(n - 1)]
+        s["ribbon_faces"] = np.array(f, np.uint32)
+        # curb edges (bottom and top of the ramp), as 3D segments along the curb
+        edges = []
+        for se in (c - w / 2, c + w / 2):
+            z = analyze_boundary.design_matrix(np.array([se]), c, w) @ beta
+            p = np.asarray(s["mean"]) + se * nrm
+            edges.append(np.array([np.r_[p + a0 * tan, z], np.r_[p + a1 * tan, z]]))
+        s["edges_xyz"] = np.array(edges)                             # (2, 2, 3)
+        s["uv_ribbon"] = self.to_uv(np.vstack((A, B[::-1])))         # outline polygon
+        s["uv_edges"] = [self.to_uv(e) for e in edges]
+        s["curb_zone"] = np.abs(s["s"] - c) <= w / 2 + 0.15
+
+    def describe(self, k):
+        s = self.slices[k]
+        return f"{k}  ·  {s['side'][0].upper()}  ·  {s['step_cm']:5.1f} cm  ·  {s['depth']:4.1f} m"
+
+
+# ----------------------------------------------------------------------------- photo overlay
+def _ok(uv):
+    return uv[np.isfinite(uv).all(1)]
+
+
+def _line(d, uv, color, width, outline=True):
+    pts = [tuple(p) for p in _ok(uv)]
+    if len(pts) < 2:
+        return
+    if outline:
+        d.line(pts, fill=OUTLINE, width=width + 3)
+    d.line(pts, fill=color, width=width)
+
+
+def render_overlay(fr, sel, visible, pick=None):
+    base = Image.fromarray((fr.img * 0.85).astype(np.uint8)).convert("RGBA")
+    fill = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    fd = ImageDraw.Draw(fill)
+
+    # translucent ribbons
+    for k in visible:
+        s = fr.slices[k]
+        poly = [tuple(p) for p in _ok(s["uv_ribbon"])]
+        if len(poly) >= 3:
+            col = SELECTED if k == sel else SIDE_COLOR[s["side"]]
+            fd.polygon(poly, fill=col + ((130,) if k == sel else (70,)))
+    img = Image.alpha_composite(base, fill).convert("RGB")
+    d = ImageDraw.Draw(img)
+
+    # selected slice: its LiDAR points, coloured by label
+    s = fr.slices[sel]
+    cols = label_colors(s["lab"], fr.road_id)
+    uv = s["uv_pts"]
+    okm = np.isfinite(uv).all(1)
+    for (x, y), c in zip(uv[okm], cols[okm]):
+        d.point((x, y), fill=tuple(int(v) for v in c))
+
+    # profiles + curb edges (others first, selected on top)
+    for k in [k for k in visible if k != sel] + [sel]:
+        sk = fr.slices[k]
+        col = SELECTED if k == sel else SIDE_COLOR[sk["side"]]
+        wide = 4 if k == sel else 3
+        _line(d, sk["uv_curve"], col, wide - 1)
+        for e in sk["uv_edges"]:
+            _line(d, e, col, wide + 1)
+        a = sk["uv_anchor"]
+        if np.isfinite(a).all():
+            r = 7 if k == sel else 5
+            d.ellipse([a[0] - r, a[1] - r, a[0] + r, a[1] + r], fill=col, outline=OUTLINE, width=2)
+
+    if pick is not None:
+        p = fr.to_uv(pick["xyz"][None])[0]
+        if np.isfinite(p).all():
+            x, y = p
+            for w_, c_ in ((5, OUTLINE), (2, PICK)):
+                d.line([(x - 14, y), (x - 4, y)], fill=c_, width=w_)
+                d.line([(x + 4, y), (x + 14, y)], fill=c_, width=w_)
+                d.line([(x, y - 14), (x, y - 4)], fill=c_, width=w_)
+                d.line([(x, y + 4), (x, y + 14)], fill=c_, width=w_)
+    full = np.asarray(img)
+
+    # zoom on the selected slice (points + ribbon)
+    pts = np.vstack([_ok(uv), _ok(s["uv_ribbon"])])
+    if len(pts):
+        lo = np.maximum(pts.min(0) - 40, 0).astype(int)
+        hi = np.minimum(pts.max(0) + 40, [fr.W, fr.H]).astype(int)
+        w, h = hi - lo
+        if w > 3 * h:  # keep at most 3:1
+            cy, h = (lo[1] + hi[1]) // 2, w // 3
+            lo[1], hi[1] = max(cy - h // 2, 0), min(cy + h // 2, fr.H)
+        crop = Image.fromarray(full[lo[1]:hi[1], lo[0]:hi[0]])
+        crop = crop.resize((700, max(int(crop.height * 700 / max(crop.width, 1)), 1)), Image.LANCZOS)
+        zoom = np.asarray(crop)
+    else:
+        zoom = np.zeros((10, 10, 3), np.uint8)
+    return full, zoom
+
+
+# ----------------------------------------------------------------------------- plots / text
+def cross_section_figure(fr, k):
+    s = fr.slices[k]
+    fit = s["fit"]
+    road = s["lab"] == fr.road_id
+    fig = go.Figure()
+    for mask, name, rgb in ((road, "road", ROAD_RGB), (~road, "sidewalk", SIDE_RGB)):
+        fig.add_trace(go.Scattergl(x=s["s"][mask] * 100, y=s["z"][mask] * 100, mode="markers", name=name,
+                                   marker=dict(size=3, color=hexc(rgb), opacity=0.35)))
+    fig.add_trace(go.Scatter(x=s["bins"][:, 0] * 100, y=s["bins"][:, 1] * 100, mode="lines",
+                             name="bin median", line=dict(color="black", width=2)))
+    fig.add_trace(go.Scatter(x=s["fit_sz"][:, 0] * 100, y=s["fit_sz"][:, 1] * 100, mode="lines",
+                             name="fit", line=dict(color=hexc(SELECTED), width=3)))
+    c, w = fit["c"] * 100, fit["width"] * 100
+    fig.add_vrect(x0=c - w / 2, x1=c + w / 2, fillcolor=hexc(SELECTED), opacity=0.12, line_width=0)
+    fig.update_layout(
+        title=dict(text=f"slice {k} · {s['side']} curb · step {s['step_cm']:.1f} cm", font=dict(size=13)),
+        xaxis_title="across curb s (cm), road → sidewalk", yaxis_title="world z (cm)",
+        margin=dict(l=50, r=10, t=35, b=40), legend=dict(orientation="h", y=-0.25, font=dict(size=10)),
+        plot_bgcolor="white", height=330,
+    )
+    # explicit range (the browser keeps a previous "reversed" state otherwise);
+    # left curbs are flipped so the plot reads like the image
+    lo, hi = s["s"].min() * 100 - 5, s["s"].max() * 100 + 5
+    fig.update_xaxes(range=[hi, lo] if s["side"] == "left" else [lo, hi], autorange=False, gridcolor="#eee")
+    fig.update_yaxes(gridcolor="#eee")
+    return fig
+
+
+def heights_figure(fr, sel, visible):
+    fig = go.Figure()
+    for side in ("left", "right", "unknown"):
+        ks = [k for k in visible if fr.slices[k]["side"] == side]
+        if not ks:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[fr.slices[k]["depth"] for k in ks], y=[fr.slices[k]["step_cm"] for k in ks],
+            mode="markers+lines+text", name=side, text=[str(k) for k in ks], textposition="top center",
+            marker=dict(size=9, color=hexc(SIDE_COLOR[side])), line=dict(width=1, dash="dot")))
+    s = fr.slices[sel]
+    fig.add_trace(go.Scatter(x=[s["depth"]], y=[s["step_cm"]], mode="markers", name="selected",
+                             marker=dict(size=16, color="rgba(0,0,0,0)", line=dict(color=hexc(SELECTED), width=3))))
+    fig.update_layout(xaxis_title="camera depth (m)", yaxis_title="step height (cm)", height=260,
+                      margin=dict(l=50, r=10, t=10, b=40), plot_bgcolor="white",
+                      legend=dict(orientation="h", y=-0.35, font=dict(size=10)))
+    fig.update_xaxes(gridcolor="#eee")
+    fig.update_yaxes(gridcolor="#eee")
+    return fig
+
+
+def readout(fr, k):
+    s = fr.slices[k]
+    b = s["fit"]["beta"]  # [b, m_r, h, m_s, q]
+    n_road = int((s["lab"] == fr.road_id).sum())
+    return (
+        f"**Slice {k}** · {s['side']} curb · camera depth {s['depth']:.1f} m\n\n"
+        f"| | |\n|---|---|\n"
+        f"| step height | **{s['step_cm']:.1f} cm** |\n"
+        f"| ramp width | {s['fit']['width'] * 100:.0f} cm |\n"
+        f"| road slope / curvature | {b[1] * 100:.1f} % / {b[4]:.3f} m⁻¹ |\n"
+        f"| sidewalk slope | {b[3] * 100:.1f} % |\n"
+        f"| fit RMSE (bins) | {np.sqrt(s['fit']['mse']) * 100:.2f} cm |\n"
+        f"| points (road / sidewalk) | {n_road} / {len(s['lab']) - n_road} |\n"
+    )
+
+
+# ----------------------------------------------------------------------------- arrow keys
+# viser has no keyboard API and uses the arrow keys for its camera. This snippet (run via an
+# <img onerror> in a GUI html element) grabs ←/→ before viser sees them and pings a tiny
+# local HTTP endpoint, which steps the selection on the Python side.
+KEY_JS = (
+    "if(!window.__curbKeys){{window.__curbKeys=1;"
+    "const u='http://'+location.hostname+':{port}/key?a=';"
+    "const send=a=>fetch(u+encodeURIComponent(a),{{mode:'no-cors'}}).catch(()=>{{}});"
+    "const act=e=>{{"
+    "if(e.metaKey||e.ctrlKey||e.altKey)return null;"            # leave browser shortcuts alone (Cmd+[ = back)
+    "const k=e.key;"
+    "if(k==='ArrowLeft')return e.shiftKey?'frame_prev':'slice_prev';"
+    "if(k==='ArrowRight')return e.shiftKey?'frame_next':'slice_next';"
+    "if(k==='[')return 'frame_prev';if(k===']')return 'frame_next';"
+    "if(k==='Tab'&&!e.shiftKey)return 'side';"
+    "if(k==='f'||k==='F')return 'focus';if(k==='c'||k==='C')return 'camera';"
+    "if(k==='l'||k==='L')return 'lock';"
+    "if(k==='Escape')return 'escape';if(k==='?')return 'help';if(k==='Home')return 'recenter';"
+    "return null;}};"
+    "const h=e=>{{const t=e.target;"
+    "if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable))return;"
+    "const a=act(e);if(!a)return;"
+    "e.stopImmediatePropagation();e.preventDefault();"          # viser never sees these keys
+    "if(e.type==='keydown'&&!e.repeat)send(a);}};"
+    "window.addEventListener('keydown',h,true);window.addEventListener('keyup',h,true);}}"
+)
+
+KEY_HELP = """
+| Key | Action |
+|---|---|
+| **← / →** | previous / next slice |
+| **Shift + ← / →**, **[ / ]** | previous / next frame |
+| **L** | lock / unlock the camera between frames (off = follow the car) |
+| **Tab** | curb side: Both → Left → Right |
+| **F** | focus on the selected slice |
+| **C** | view from the car's camera |
+| **Home** | re-centre the view on this frame |
+| **Esc** | clear the picked point (or close this window) |
+| **?** | show / hide this window |
+| **Shift + click** | pick a point in 3D (shown in the photo) |
+| W A S D / Q E / ↑ ↓ | move / raise / tilt the 3D camera |
+| mouse | left-drag orbit · right-drag pan · scroll zoom |
+"""
+
+
+def start_key_server(port, on_action):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                on_action(q.get("a", [""])[0])
+            except Exception as e:  # never let a bad request kill the server
+                print("key handler error:", e)
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+# ----------------------------------------------------------------------------- viewer
+class CurbViewer:
+    def __init__(self, paths, port=8080, key_port=None, panel_width=520):
+        self.paths = [Path(p) for p in paths]
+        self._frames = {}                      # cache: index -> Frame (loaded on first view)
+        self._origins = {}                     # seq -> shared 3D origin (world coords differ per drive)
+        self.frame_i = 0
+        self.fr = self._load(0)
+        self.help_modal = None
+        self.lock = threading.RLock()
+        self.server = viser.ViserServer(port=port, label="curb viewer")
+        self.server.gui.configure_theme(show_share_button=False)
+        # side panel docked on the right; the 3D view fills the rest. Drag its edge to resize.
+        self.server.gui.main_panel.dock_right()
+        self.server.gui.main_panel.set_width(panel_width)
+        self.server.scene.set_up_direction("+z")
+        self.key_port = key_port or port + 1
+        self.key_server = start_key_server(self.key_port, self.on_key)
+        self.sel = 0
+        self.exag = 1.0
+        self.pick = None
+        self.handles = {}
+        self._build_gui()
+        self._build_scene()
+        self._register_scene_callbacks()
+        self.select(self.visible()[0])
+
+    # ---------------- frames
+    def _load(self, i):
+        if i not in self._frames:
+            fr = Frame(self.paths[i])
+            seq = str(fr.meta["seq"])
+            fr.origin = self._origins.setdefault(seq, fr.center)  # first frame of a drive sets its origin
+            self._frames[i] = fr
+        return self._frames[i]
+
+    def _header(self):
+        fr = self.fr
+        return (f"**{fr.meta['seq']}** · frame **{int(fr.meta['frame'])}** · {fr.K} slices "
+                f"({int(np.isnan(fr.meta['all_heights_cm']).sum())} failed bands)")
+
+    def switch_frame(self, i):
+        """Replace the whole scene and all panels with another .npz from the list."""
+        with self.lock:
+            if i == self.frame_i:
+                return
+            old = self.fr
+            prev = old.slices[self.sel] if 0 <= self.sel < old.K else None
+            # remove the old frame's 3D nodes (children first, then the parent frame)
+            for key, h in self.handles.items():
+                for node in (h.values() if isinstance(h, dict) else [h]):
+                    if hasattr(node, "remove"):
+                        node.remove()
+            self.world.remove()
+            self.handles = {}
+            self.frame_i = i
+            self.fr = self._load(i)
+            self.fr.set_ribbon_params(self.rib_len.value, self.rib_margin.value / 100, self.rib_extent.value)
+            self._build_scene()
+            self._switching = True             # ignore the dropdown's on_update while we refill it
+            self.slice_dd.options = [self.fr.describe(k) for k in range(self.fr.K)]
+            self._switching = False
+            self.header.content = self._header()
+            if hasattr(self, "frame_dd") and self.frame_dd.value != self.frame_dd.options[i]:
+                self.frame_dd.value = self.frame_dd.options[i]
+            same_drive = str(old.meta["seq"]) == str(self.fr.meta["seq"])
+            locked = self.lock_cam.value and same_drive
+            self.sel = -1
+            self.select(self._follow_selection(prev, locked))
+            self._set_pick(self.pick)          # picked point is a world position: keep it, re-project it
+            clients = self.server.get_clients().values()
+            if not same_drive:                 # other drive = other world coordinates: re-centre
+                for client in clients:
+                    self._reset_camera(client)
+            elif not locked:                   # follow the car: move the view by the car's displacement
+                delta = (self.fr.c2w[:3, 3] - old.c2w[:3, 3]) * [1, 1, self.exag]
+                for client in clients:
+                    # read both first: in viser, setting position also shifts look_at
+                    pos, look = np.array(client.camera.position), np.array(client.camera.look_at)
+                    with client.atomic():
+                        client.camera.position = pos + delta
+                        client.camera.look_at = look + delta
+            # locked: same origin, camera untouched -> the world stays still on screen
+
+    def _follow_selection(self, prev, locked):
+        """Which slice to select after a frame change (within the current curb-side filter).
+
+        locked camera  -> the slice closest in world XY to the previous one (same piece of curb)
+        following car  -> same curb side, closest camera depth (same place relative to the car)
+        """
+        vis = self.visible()
+        if prev is None:
+            return vis[0]
+        if locked:
+            d = [np.linalg.norm(self.fr.slices[k]["anchor_3d"][:2] - prev["anchor_3d"][:2]) for k in vis]
+            return vis[int(np.argmin(d))]
+        same_side = [k for k in vis if self.fr.slices[k]["side"] == prev["side"]] or vis
+        d = [abs(self.fr.slices[k]["depth"] - prev["depth"]) for k in same_side]
+        return same_side[int(np.argmin(d))]
+
+    def step_frame(self, d):
+        if len(self.paths) > 1:
+            self.switch_frame((self.frame_i + d) % len(self.paths))
+
+    def cycle_side(self):
+        opts = self.side_filter.options
+        self.side_filter.value = opts[(opts.index(self.side_filter.value) + 1) % len(opts)]
+
+    def toggle_help(self, force_close=False):
+        if self.help_modal is not None and not self.help_modal.closed:
+            self.help_modal.close()
+            self.help_modal = None
+            return True
+        if force_close:
+            return False
+        with self.server.gui.add_modal("Keyboard shortcuts") as modal:
+            self.server.gui.add_markdown(KEY_HELP)
+            self.server.gui.add_button("Close").on_click(lambda _: self.toggle_help(force_close=True))
+        self.help_modal = modal
+        return True
+
+    def on_key(self, action):
+        """Actions sent by the in-page key listener (see KEY_JS)."""
+        clients = list(self.server.get_clients().values())
+        if action in ("slice_prev", "slice_next"):
+            self.step(-1 if action == "slice_prev" else 1)
+        elif action in ("frame_prev", "frame_next"):
+            self.step_frame(-1 if action == "frame_prev" else 1)
+        elif action == "side":
+            self.cycle_side()
+        elif action == "focus":
+            for c in clients:
+                self._focus(c)
+        elif action == "camera":
+            for c in clients:
+                self._view_from_camera(c)
+        elif action == "recenter":
+            for c in clients:
+                self._reset_camera(c)
+        elif action == "escape":
+            if not self.toggle_help(force_close=True):
+                self._set_pick(None)
+        elif action == "help":
+            self.toggle_help()
+        elif action == "lock":
+            self.lock_cam.value = not self.lock_cam.value
+
+    def visible(self):
+        f = self.side_filter.value.lower()
+        ks = [k for k, s in enumerate(self.fr.slices) if f == "both" or s["side"] == f]
+        return ks or list(range(self.fr.K))
+
+    # ---------------- GUI
+    def _build_gui(self):
+        g, fr = self.server.gui, self.fr
+        self._switching = False
+        if len(self.paths) > 1:
+            self.frame_dd = g.add_dropdown("Frame", [frame_label(p) for p in self.paths],
+                                           hint=f"{len(self.paths)} files; each is loaded the first time you open it")
+            self.frame_dd.on_update(lambda _: self.switch_frame(self.frame_dd.options.index(self.frame_dd.value)))
+            # (switch_frame returns early when the index is already current, so setting it from keys is safe)
+        self.header = g.add_markdown(self._header())
+
+        with g.add_folder("Photo"):
+            blank = np.zeros((10, 10, 3), np.uint8)
+            self.img_full = g.add_image(blank, label="camera (selected = magenta)", format="jpeg", jpeg_quality=88)
+            self.img_zoom = g.add_image(blank, label="zoom on selected slice", format="jpeg", jpeg_quality=92)
+
+        with g.add_folder("Slice"):
+            self.side_filter = g.add_dropdown("Curb side", ["Both", "Left", "Right"])
+            self.slice_dd = g.add_dropdown("Slice", [fr.describe(k) for k in range(fr.K)],
+                                           hint="slice · side · height · depth")
+            g.add_html(
+                '<div style="font-size:12px;opacity:.7;padding:2px 0 4px">'
+                '<b>← / →</b> slice · <b>shift+← / →</b> frame · <b>Tab</b> curb side · <b>L</b> lock camera · '
+                '<b>?</b> all shortcuts (click the 3D view first)</div>'
+                f'<img src="/__curb_keys_{self.key_port}.png" style="display:none" '
+                f'onerror="{KEY_JS.format(port=self.key_port)}">'
+            )
+            self.info = g.add_markdown("")
+            self.pick_info = g.add_markdown("")
+
+        with g.add_folder("Cross-section"):
+            self.xsec = g.add_plotly(go.Figure(), aspect=1.6)
+
+        with g.add_folder("Heights by depth", expand_by_default=False):
+            self.hplot = g.add_plotly(go.Figure(), aspect=2.0)
+
+        with g.add_folder("3D display"):
+            self.color_mode = g.add_dropdown("Colour points by", ["Height above road", "Road / sidewalk"])
+            g.add_markdown(f"<small>height colours: dark purple ≤ {HEIGHT_RANGE[0] * 100:.0f} cm → "
+                           f"green → yellow ≥ {HEIGHT_RANGE[1] * 100:.0f} cm</small>")
+            self.exag_slider = g.add_slider("Vertical exaggeration", 1.0, 10.0, 0.5, 3.0,
+                                            hint="Scales heights in the 3D view only")
+            self.pt_size = g.add_slider("Point size (cm)", 0.5, 4.0, 0.5, 2.0)
+            self.show_ctx = g.add_checkbox("LiDAR context", True)
+            self.show_all_pts = g.add_checkbox("Points of all slices", False)
+            self.show_labels = g.add_checkbox("Height labels", True)
+            self.show_cam = g.add_checkbox("Camera position", True)
+            self.lock_cam = g.add_checkbox("Lock camera between frames", False,
+                                           hint="Off: the view follows the car when you change frame. "
+                                                "On: the view stays fixed in the world, to compare one piece "
+                                                "of curb across frames. Key: L")
+            self.btn_focus = g.add_button("Focus on selected slice")
+            self.btn_cam = g.add_button("View from camera", hint="Looks through the camera (resets exaggeration to 1)")
+            self.btn_clear = g.add_button("Clear picked point")
+            self.btn_recenter = g.add_button("Re-centre on this frame")
+            self.btn_help = g.add_button("Keyboard shortcuts (?)")
+
+        with g.add_folder("Curb ribbons"):
+            self.show_ribbons = g.add_checkbox("Show ribbons", True)
+            self.rib_extent = g.add_checkbox("Length = data extent", False,
+                                             hint="Span the along-curb range covered by the slice's points "
+                                                  "(how much curb the fit really averages over)")
+            self.rib_len = g.add_slider("Length along curb (m)", 0.2, 6.0, 0.1, RIBBON_LENGTH)
+            self.rib_margin = g.add_slider("Road/sidewalk margin (cm)", 0, 150, 5, RIBBON_MARGIN * 100,
+                                           hint="How much flat road and sidewalk to show each side of the ramp")
+
+        self.side_filter.on_update(lambda _: self.select(self.sel if self.sel in self.visible() else self.visible()[0]))
+        self.slice_dd.on_update(lambda _: not self._switching
+                                and (k := self.slice_dd.options.index(self.slice_dd.value)) != self.sel
+                                and self.select(k))
+        self.exag_slider.on_update(lambda _: self._set_exag(self.exag_slider.value))
+        self.color_mode.on_update(lambda _: self._recolor())
+        self.pt_size.on_update(lambda _: self._refresh_scene())
+        for cb in (self.show_ctx, self.show_all_pts, self.show_ribbons, self.show_labels, self.show_cam):
+            cb.on_update(lambda _: self._refresh_scene())
+        for ctl in (self.rib_len, self.rib_margin, self.rib_extent):
+            ctl.on_update(lambda _: self._rebuild_ribbons())
+        self.btn_focus.on_click(lambda ev: self._focus(ev.client))
+        self.btn_cam.on_click(lambda ev: self._view_from_camera(ev.client))
+        self.btn_clear.on_click(lambda _: self._set_pick(None))
+        self.btn_recenter.on_click(lambda ev: self._reset_camera(ev.client))
+        self.btn_help.on_click(lambda _: self.toggle_help())
+
+    # ---------------- 3D scene
+    def _colors(self, which):
+        fr = self.fr
+        by_h = self.color_mode.value.startswith("Height")
+        if which == "ctx":
+            return height_colors(fr.ctx_h) if by_h else label_colors(fr.ctx_lab, fr.road_id, 0.8)
+        s = fr.slices[which]
+        return height_colors(s["h"]) if by_h else label_colors(s["lab"], fr.road_id, 1.1)
+
+    def _build_scene(self):
+        sc, fr = self.server.scene, self.fr
+        self.world = sc.add_frame("/world", show_axes=False)
+        ps = self.pt_size.value / 100
+        pc_kw = dict(point_shape="circle", point_shading="gradient", precision="float32")
+
+        self.handles["ctx"] = sc.add_point_cloud("/world/context", fr.local(fr.ctx_xyz), self._colors("ctx"),
+                                                 point_size=ps * 0.8, **pc_kw)
+        for k, s in enumerate(fr.slices):
+            col = SIDE_COLOR[s["side"]]
+            pts = sc.add_point_cloud(f"/world/slice_{k}/points", fr.local(s["xyz"]), self._colors(k),
+                                     point_size=ps, visible=False, **pc_kw)
+            curve = fr.local(s["curve_xyz"]) + LIFT
+            prof = sc.add_line_segments(f"/world/slice_{k}/profile", np.stack([curve[:-1], curve[1:]], 1),
+                                        col, thickness=5, thickness_units="screen")
+            anchor = sc.add_icosphere(f"/world/slice_{k}/anchor", radius=1.0, color=col,
+                                      position=fr.local(s["anchor_3d"]))  # scaled in _refresh_scene
+            anchor.on_click(lambda _, k=k: self.select(k))
+            lab = sc.add_label(f"/world/slice_{k}/label", f"{k}: {s['step_cm']:.1f} cm",
+                               position=fr.local(s["anchor_3d"]) + [0, 0, 0.3], anchor="bottom-center")
+            self.handles[k] = dict(points=pts, profile=prof, anchor=anchor, label=lab, n_seg=len(curve) - 1)
+            self._add_ribbon(k)
+
+        self.handles["pick"] = sc.add_icosphere("/world/pick", radius=1.0, color=PICK, visible=False)
+
+        # camera position only (wireframe frustum, no image)
+        self.cam_fov = 2 * np.arctan2(fr.H / 2, fr.P[1, 1])
+        self.cam_wxyz = vtf.SO3.from_matrix(fr.c2w[:3, :3]).wxyz
+        self.cam_pos = fr.local(fr.c2w[:3, 3])
+        self.handles["cam"] = sc.add_camera_frustum(
+            "/camera", fov=self.cam_fov, aspect=fr.W / fr.H, scale=0.4, wxyz=self.cam_wxyz,
+            position=self.cam_pos, color=(30, 30, 30), thickness=3, thickness_units="screen")
+
+        self._set_exag(self.exag_slider.value)
+
+    def _register_scene_callbacks(self):
+        """Registered once; they always act on the current frame (self.fr)."""
+        @self.server.scene.on_click(modifier="shift")
+        def _(ev):
+            self._pick_from_ray(np.asarray(ev.ray_origin), np.asarray(ev.ray_direction))
+
+        self.server.on_client_connect(self._reset_camera)
+
+    def _reset_camera(self, client):
+        """Start view: behind and above the car, looking at the slices."""
+        back = self.fr.c2w[:3, 2].copy()
+        back[2] = 0
+        back /= np.linalg.norm(back) + 1e-9
+        target = self.fr.local(self.fr.center) * [1, 1, self.exag]
+        with client.atomic():
+            client.camera.up_direction = (0.0, 0.0, 1.0)
+            client.camera.position = self.cam_pos * [1, 1, self.exag] - 6 * back + np.array([0, 0, 6.0])
+            client.camera.look_at = target
+
+    def _set_exag(self, e):
+        with self.lock:
+            self.exag = float(e)
+            self.world.scale = (1.0, 1.0, self.exag)
+            self.handles["cam"].position = self.cam_pos * [1, 1, self.exag]
+            self._scale_orbs()
+
+    def _orb_scale(self, factor=1.0):
+        r = max(ORB_FACTOR * self.pt_size.value / 100, ORB_MIN_RADIUS) * factor
+        return (r, r, r / self.exag)  # undo the vertical exaggeration so orbs stay round
+
+    def _scale_orbs(self):
+        for k in range(self.fr.K):
+            self.handles[k]["anchor"].scale = self._orb_scale()
+        self.handles["pick"].scale = self._orb_scale(1.2)
+
+    def _add_ribbon(self, k):
+        """(Re)create slice k's ribbon mesh and curb-edge lines from the Frame's current geometry."""
+        sc, s, h = self.server.scene, self.fr.slices[k], self.handles[k]
+        for key in ("ribbon", "edges"):
+            if key in h:
+                h[key].remove()
+        col = SIDE_COLOR[s["side"]]
+        h["ribbon"] = sc.add_mesh_simple(f"/world/slice_{k}/ribbon", self.fr.local(s["ribbon_verts"]) + LIFT,
+                                         s["ribbon_faces"], color=col, opacity=0.85, side="double")
+        h["ribbon"].on_click(lambda _, k=k: self.select(k))
+        h["edges"] = sc.add_line_segments(f"/world/slice_{k}/edges", self.fr.local(s["edges_xyz"]) + LIFT, col,
+                                          thickness=8, thickness_units="screen")
+
+    def _rebuild_ribbons(self):
+        with self.lock:
+            self.rib_len.disabled = self.rib_extent.value
+            self.fr.set_ribbon_params(self.rib_len.value, self.rib_margin.value / 100, self.rib_extent.value)
+            for k in range(self.fr.K):
+                self._add_ribbon(k)
+            self._refresh_scene()
+            self._render_photo()
+
+    def _recolor(self):
+        with self.lock:
+            self.handles["ctx"].colors = self._colors("ctx")
+            for k in range(self.fr.K):
+                self.handles[k]["points"].colors = self._colors(k)
+
+    def _refresh_scene(self):
+        with self.lock:
+            ps = self.pt_size.value / 100
+            vis = set(self.visible())
+            self.handles["ctx"].visible = self.show_ctx.value
+            self.handles["ctx"].point_size = ps * 0.8
+            self.handles["cam"].visible = self.show_cam.value
+            self.handles["pick"].scale = self._orb_scale(1.2)
+            for k, s in enumerate(self.fr.slices):
+                h = self.handles[k]
+                on, selected = k in vis, k == self.sel
+                color = np.array(SELECTED if selected else SIDE_COLOR[s["side"]], np.uint8)
+                h["points"].visible = on and (selected or self.show_all_pts.value)
+                h["points"].point_size = ps
+                h["profile"].visible = on
+                h["profile"].colors = color  # single colour: switching to per-vertex arrays turns lines grey in viser
+                h["profile"].thickness = 9 if selected else 5
+                h["ribbon"].visible = on and self.show_ribbons.value
+                h["ribbon"].color = tuple(int(c) for c in color)
+                h["edges"].visible = on and self.show_ribbons.value
+                h["edges"].colors = color
+                h["edges"].thickness = 12 if selected else 8
+                h["anchor"].visible = on
+                h["anchor"].color = tuple(int(c) for c in color)
+                h["anchor"].scale = self._orb_scale(1.3 if selected else 1.0)
+                h["label"].visible = on and (self.show_labels.value or selected)
+
+    # ---------------- picking
+    def _pick_from_ray(self, o, d):
+        fr = self.fr
+        pools = [fr.ctx_xyz] + [s["xyz"] for s in fr.slices]
+        xyz = np.vstack(pools)
+        scene = fr.local(xyz) * [1, 1, self.exag]
+        d = d / np.linalg.norm(d)
+        t = (scene - o) @ d
+        perp = np.linalg.norm(scene - o - t[:, None] * d, axis=1)
+        ok = (t > 0) & (perp < np.maximum(0.08, 0.008 * t))
+        if not ok.any():
+            return
+        cand = np.flatnonzero(ok)
+        best = cand[np.argmin(t[cand] + 5 * perp[cand])]  # front-most, closest to the ray
+        p = xyz[best]
+        lab = np.concatenate([fr.ctx_lab] + [s["lab"] for s in fr.slices])[best]
+        self._set_pick(dict(xyz=p, lab=int(lab), h=float(fr.height_above_road(p[None])[0])))
+
+    def _set_pick(self, pick):
+        with self.lock:
+            self.pick = pick
+            hp = self.handles["pick"]
+            if pick is None:
+                hp.visible = False
+                self.pick_info.content = ""
+            else:
+                hp.position = self.fr.local(pick["xyz"])
+                hp.visible = True
+                name = "road" if pick["lab"] == self.fr.road_id else "sidewalk"
+                self.pick_info.content = (f"**Picked point** ({name}): height above road "
+                                          f"**{pick['h'] * 100:.1f} cm** · green cross in the photo")
+            self._render_photo()
+
+    # ---------------- selection
+    def step(self, d):
+        ks = self.visible()
+        i = ks.index(self.sel) if self.sel in ks else 0
+        self.select(ks[(i + d) % len(ks)])
+
+    def select(self, k):
+        with self.lock:
+            k = int(k)
+            self.sel = k
+            fr, vis = self.fr, self.visible()
+            if self.slice_dd.value != fr.describe(k):
+                self.slice_dd.value = fr.describe(k)  # on_update sees k == self.sel and does nothing
+            self.info.content = readout(fr, k)
+            self._render_photo()
+            self.xsec.figure = cross_section_figure(fr, k)
+            self.hplot.figure = heights_figure(fr, k, vis)
+            self._refresh_scene()
+
+    def _render_photo(self):
+        full, zoom = render_overlay(self.fr, self.sel, self.visible(), self.pick)
+        self.img_full.image = full
+        self.img_zoom.image = zoom
+
+    def _focus(self, client):
+        if client is None:
+            return
+        s = self.fr.slices[self.sel]
+        a = self.fr.local(s["anchor_3d"]) * [1, 1, self.exag]
+        n = np.r_[s["normal"], 0]
+        along = np.cross([0, 0, 1], n)
+        with client.atomic():
+            client.camera.position = a - 2.0 * n + 1.5 * along + np.array([0, 0, 2.5])
+            client.camera.look_at = a
+
+    def _view_from_camera(self, client):
+        if client is None:
+            return
+        self.exag_slider.value = 1.0
+        self._set_exag(1.0)
+        with client.atomic():
+            client.camera.fov = float(self.cam_fov)
+            client.camera.position = self.cam_pos
+            client.camera.wxyz = self.cam_wxyz
+
+    def run(self):
+        print(f"\n  curb viewer running -> http://localhost:{self.server.get_port()}   (Ctrl+C to stop)"
+              f"\n  (arrow keys use port {self.key_port})\n")
+        self.server.sleep_forever()
+
+
+def frame_label(path):
+    """'..._drive_0000_sync_cam0_frame000325_slices.npz' -> 'drive_0000 · frame 325'."""
+    name = Path(path).name
+    drive, frame = re.search(r"drive_\d+", name), re.search(r"frame(\d+)", name)
+    if not frame:
+        return Path(path).stem
+    return (f"{drive.group(0)} · " if drive else "") + f"frame {int(frame.group(1))}"
+
+
+def collect_npz(inputs):
+    """Files and/or folders -> sorted list of *_slices.npz paths (sorted by drive, then frame)."""
+    paths = []
+    for p in map(Path, inputs):
+        paths += sorted(p.glob("*_slices.npz")) if p.is_dir() else [p]
+    def key(p):
+        drive, frame = re.search(r"drive_\d+", p.name), re.search(r"frame(\d+)", p.name)
+        return (drive.group(0) if drive else "", int(frame.group(1)) if frame else 0, p.name)
+    paths = sorted(dict.fromkeys(paths), key=key)
+    if not paths:
+        raise SystemExit(f"No *_slices.npz files found in {inputs}")
+    return paths
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Interactive viewer for curb slice results (.npz).")
+    ap.add_argument("npz", nargs="+", type=Path,
+                    help="one or more .npz files and/or folders of them (e.g. ../outputs/slices)")
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--key-port", type=int, default=None, help="port for arrow-key events (default: port+1)")
+    ap.add_argument("--panel-width", type=int, default=520, help="initial side panel width in px (drag to resize)")
+    args = ap.parse_args()
+    CurbViewer(collect_npz(args.npz), port=args.port, key_port=args.key_port, panel_width=args.panel_width).run()
+
+
+if __name__ == "__main__":
+    main()
