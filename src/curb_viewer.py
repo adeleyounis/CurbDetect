@@ -6,11 +6,16 @@ Interactive viewer for one frame's curb slices (the .npz written by results_io.s
     python curb_viewer.py ../outputs/slices/<file>.npz [more.npz]  # specific files
     -> open http://localhost:8080   (with several files, pick one in the "Frame" dropdown)
 
-Controls
-  ← / →          previous / next slice (click the 3D view first so the page has focus)
-  click a ball   select that slice
-  shift + click  pick any LiDAR point in 3D -> marked in 3D and in the photo, with its height above road
-  mouse / WASD / ↑↓ / QE   move the 3D camera (viser defaults)
+Controls (click the 3D view first so the page has focus; press ? in the viewer for this list)
+  ← / →                    previous / next slice
+  shift + ← / →, [ / ]     previous / next frame (the view follows the car, or stays fixed if locked)
+  L                        lock / unlock the camera between frames
+  Tab                      curb side: Both -> Left -> Right
+  F / C / Home             focus selected slice / view from camera / re-centre on this frame
+  Esc                      clear the picked point (or close the help window)
+  click an orb or ribbon   select that slice
+  shift + click            pick any LiDAR point in 3D -> marked in 3D and in the photo, with its height above road
+  mouse / WASD / QE / ↑↓   move the 3D camera (viser defaults)
 
 3D view
   * points are coloured by height above the local road surface (or by road/sidewalk label),
@@ -98,7 +103,10 @@ class Frame:
         self.H, self.W = self.img.shape[:2]
 
         anchors = np.array([s["anchor_3d"] for s in self.slices])
-        self.origin = np.r_[anchors[:, :2].mean(0), np.median(anchors[:, 2])]
+        self.center = np.r_[anchors[:, :2].mean(0), np.median(anchors[:, 2])]  # middle of this frame's slices
+        # 3D coordinates are world - origin. The viewer replaces this with one origin shared by all
+        # frames of the same drive, so the camera does not jump when switching frames.
+        self.origin = self.center.copy()
 
         self.ribbon_length, self.ribbon_margin, self.ribbon_data_extent = RIBBON_LENGTH, RIBBON_MARGIN, False
 
@@ -354,21 +362,51 @@ def readout(fr, k):
 # local HTTP endpoint, which steps the selection on the Python side.
 KEY_JS = (
     "if(!window.__curbKeys){{window.__curbKeys=1;"
-    "const u='http://'+location.hostname+':{port}/key?d=';"
-    "const h=e=>{{if(e.key!=='ArrowLeft'&&e.key!=='ArrowRight')return;"
-    "const t=e.target;if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable))return;"
-    "e.stopImmediatePropagation();e.preventDefault();"
-    "if(e.type==='keydown'&&!e.repeat)fetch(u+(e.key==='ArrowLeft'?-1:1),{{mode:'no-cors'}}).catch(()=>{{}});}};"
+    "const u='http://'+location.hostname+':{port}/key?a=';"
+    "const send=a=>fetch(u+encodeURIComponent(a),{{mode:'no-cors'}}).catch(()=>{{}});"
+    "const act=e=>{{"
+    "if(e.metaKey||e.ctrlKey||e.altKey)return null;"            # leave browser shortcuts alone (Cmd+[ = back)
+    "const k=e.key;"
+    "if(k==='ArrowLeft')return e.shiftKey?'frame_prev':'slice_prev';"
+    "if(k==='ArrowRight')return e.shiftKey?'frame_next':'slice_next';"
+    "if(k==='[')return 'frame_prev';if(k===']')return 'frame_next';"
+    "if(k==='Tab'&&!e.shiftKey)return 'side';"
+    "if(k==='f'||k==='F')return 'focus';if(k==='c'||k==='C')return 'camera';"
+    "if(k==='l'||k==='L')return 'lock';"
+    "if(k==='Escape')return 'escape';if(k==='?')return 'help';if(k==='Home')return 'recenter';"
+    "return null;}};"
+    "const h=e=>{{const t=e.target;"
+    "if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable))return;"
+    "const a=act(e);if(!a)return;"
+    "e.stopImmediatePropagation();e.preventDefault();"          # viser never sees these keys
+    "if(e.type==='keydown'&&!e.repeat)send(a);}};"
     "window.addEventListener('keydown',h,true);window.addEventListener('keyup',h,true);}}"
 )
 
+KEY_HELP = """
+| Key | Action |
+|---|---|
+| **← / →** | previous / next slice |
+| **Shift + ← / →**, **[ / ]** | previous / next frame |
+| **L** | lock / unlock the camera between frames (off = follow the car) |
+| **Tab** | curb side: Both → Left → Right |
+| **F** | focus on the selected slice |
+| **C** | view from the car's camera |
+| **Home** | re-centre the view on this frame |
+| **Esc** | clear the picked point (or close this window) |
+| **?** | show / hide this window |
+| **Shift + click** | pick a point in 3D (shown in the photo) |
+| W A S D / Q E / ↑ ↓ | move / raise / tilt the 3D camera |
+| mouse | left-drag orbit · right-drag pan · scroll zoom |
+"""
 
-def start_key_server(port, on_step):
+
+def start_key_server(port, on_action):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             q = parse_qs(urlparse(self.path).query)
             try:
-                on_step(int(q.get("d", ["0"])[0]))
+                on_action(q.get("a", [""])[0])
             except Exception as e:  # never let a bad request kill the server
                 print("key handler error:", e)
             self.send_response(204)
@@ -388,8 +426,10 @@ class CurbViewer:
     def __init__(self, paths, port=8080, key_port=None, panel_width=520):
         self.paths = [Path(p) for p in paths]
         self._frames = {}                      # cache: index -> Frame (loaded on first view)
+        self._origins = {}                     # seq -> shared 3D origin (world coords differ per drive)
         self.frame_i = 0
         self.fr = self._load(0)
+        self.help_modal = None
         self.lock = threading.RLock()
         self.server = viser.ViserServer(port=port, label="curb viewer")
         self.server.gui.configure_theme(show_share_button=False)
@@ -398,7 +438,7 @@ class CurbViewer:
         self.server.gui.main_panel.set_width(panel_width)
         self.server.scene.set_up_direction("+z")
         self.key_port = key_port or port + 1
-        self.key_server = start_key_server(self.key_port, self.step)
+        self.key_server = start_key_server(self.key_port, self.on_key)
         self.sel = 0
         self.exag = 1.0
         self.pick = None
@@ -411,7 +451,10 @@ class CurbViewer:
     # ---------------- frames
     def _load(self, i):
         if i not in self._frames:
-            self._frames[i] = Frame(self.paths[i])
+            fr = Frame(self.paths[i])
+            seq = str(fr.meta["seq"])
+            fr.origin = self._origins.setdefault(seq, fr.center)  # first frame of a drive sets its origin
+            self._frames[i] = fr
         return self._frames[i]
 
     def _header(self):
@@ -424,6 +467,8 @@ class CurbViewer:
         with self.lock:
             if i == self.frame_i:
                 return
+            old = self.fr
+            prev = old.slices[self.sel] if 0 <= self.sel < old.K else None
             # remove the old frame's 3D nodes (children first, then the parent frame)
             for key, h in self.handles.items():
                 for node in (h.values() if isinstance(h, dict) else [h]):
@@ -434,17 +479,94 @@ class CurbViewer:
             self.frame_i = i
             self.fr = self._load(i)
             self.fr.set_ribbon_params(self.rib_len.value, self.rib_margin.value / 100, self.rib_extent.value)
-            self.pick = None
-            self.pick_info.content = ""
             self._build_scene()
             self._switching = True             # ignore the dropdown's on_update while we refill it
             self.slice_dd.options = [self.fr.describe(k) for k in range(self.fr.K)]
             self._switching = False
             self.header.content = self._header()
+            if hasattr(self, "frame_dd") and self.frame_dd.value != self.frame_dd.options[i]:
+                self.frame_dd.value = self.frame_dd.options[i]
+            same_drive = str(old.meta["seq"]) == str(self.fr.meta["seq"])
+            locked = self.lock_cam.value and same_drive
             self.sel = -1
-            self.select(self.visible()[0])
-            for client in self.server.get_clients().values():
-                self._reset_camera(client)
+            self.select(self._follow_selection(prev, locked))
+            self._set_pick(self.pick)          # picked point is a world position: keep it, re-project it
+            clients = self.server.get_clients().values()
+            if not same_drive:                 # other drive = other world coordinates: re-centre
+                for client in clients:
+                    self._reset_camera(client)
+            elif not locked:                   # follow the car: move the view by the car's displacement
+                delta = (self.fr.c2w[:3, 3] - old.c2w[:3, 3]) * [1, 1, self.exag]
+                for client in clients:
+                    # read both first: in viser, setting position also shifts look_at
+                    pos, look = np.array(client.camera.position), np.array(client.camera.look_at)
+                    with client.atomic():
+                        client.camera.position = pos + delta
+                        client.camera.look_at = look + delta
+            # locked: same origin, camera untouched -> the world stays still on screen
+
+    def _follow_selection(self, prev, locked):
+        """Which slice to select after a frame change (within the current curb-side filter).
+
+        locked camera  -> the slice closest in world XY to the previous one (same piece of curb)
+        following car  -> same curb side, closest camera depth (same place relative to the car)
+        """
+        vis = self.visible()
+        if prev is None:
+            return vis[0]
+        if locked:
+            d = [np.linalg.norm(self.fr.slices[k]["anchor_3d"][:2] - prev["anchor_3d"][:2]) for k in vis]
+            return vis[int(np.argmin(d))]
+        same_side = [k for k in vis if self.fr.slices[k]["side"] == prev["side"]] or vis
+        d = [abs(self.fr.slices[k]["depth"] - prev["depth"]) for k in same_side]
+        return same_side[int(np.argmin(d))]
+
+    def step_frame(self, d):
+        if len(self.paths) > 1:
+            self.switch_frame((self.frame_i + d) % len(self.paths))
+
+    def cycle_side(self):
+        opts = self.side_filter.options
+        self.side_filter.value = opts[(opts.index(self.side_filter.value) + 1) % len(opts)]
+
+    def toggle_help(self, force_close=False):
+        if self.help_modal is not None and not self.help_modal.closed:
+            self.help_modal.close()
+            self.help_modal = None
+            return True
+        if force_close:
+            return False
+        with self.server.gui.add_modal("Keyboard shortcuts") as modal:
+            self.server.gui.add_markdown(KEY_HELP)
+            self.server.gui.add_button("Close").on_click(lambda _: self.toggle_help(force_close=True))
+        self.help_modal = modal
+        return True
+
+    def on_key(self, action):
+        """Actions sent by the in-page key listener (see KEY_JS)."""
+        clients = list(self.server.get_clients().values())
+        if action in ("slice_prev", "slice_next"):
+            self.step(-1 if action == "slice_prev" else 1)
+        elif action in ("frame_prev", "frame_next"):
+            self.step_frame(-1 if action == "frame_prev" else 1)
+        elif action == "side":
+            self.cycle_side()
+        elif action == "focus":
+            for c in clients:
+                self._focus(c)
+        elif action == "camera":
+            for c in clients:
+                self._view_from_camera(c)
+        elif action == "recenter":
+            for c in clients:
+                self._reset_camera(c)
+        elif action == "escape":
+            if not self.toggle_help(force_close=True):
+                self._set_pick(None)
+        elif action == "help":
+            self.toggle_help()
+        elif action == "lock":
+            self.lock_cam.value = not self.lock_cam.value
 
     def visible(self):
         f = self.side_filter.value.lower()
@@ -459,6 +581,7 @@ class CurbViewer:
             self.frame_dd = g.add_dropdown("Frame", [frame_label(p) for p in self.paths],
                                            hint=f"{len(self.paths)} files; each is loaded the first time you open it")
             self.frame_dd.on_update(lambda _: self.switch_frame(self.frame_dd.options.index(self.frame_dd.value)))
+            # (switch_frame returns early when the index is already current, so setting it from keys is safe)
         self.header = g.add_markdown(self._header())
 
         with g.add_folder("Photo"):
@@ -466,15 +589,14 @@ class CurbViewer:
             self.img_full = g.add_image(blank, label="camera (selected = magenta)", format="jpeg", jpeg_quality=88)
             self.img_zoom = g.add_image(blank, label="zoom on selected slice", format="jpeg", jpeg_quality=92)
 
-
         with g.add_folder("Slice"):
             self.side_filter = g.add_dropdown("Curb side", ["Both", "Left", "Right"])
             self.slice_dd = g.add_dropdown("Slice", [fr.describe(k) for k in range(fr.K)],
                                            hint="slice · side · height · depth")
             g.add_html(
                 '<div style="font-size:12px;opacity:.7;padding:2px 0 4px">'
-                '<b>← / →</b> previous / next slice (click the 3D view first) · '
-                '<b>shift+click</b> a point in 3D to locate it in the photo</div>'
+                '<b>← / →</b> slice · <b>shift+← / →</b> frame · <b>Tab</b> curb side · <b>L</b> lock camera · '
+                '<b>?</b> all shortcuts (click the 3D view first)</div>'
                 f'<img src="/__curb_keys_{self.key_port}.png" style="display:none" '
                 f'onerror="{KEY_JS.format(port=self.key_port)}">'
             )
@@ -493,14 +615,20 @@ class CurbViewer:
                            f"green → yellow ≥ {HEIGHT_RANGE[1] * 100:.0f} cm</small>")
             self.exag_slider = g.add_slider("Vertical exaggeration", 1.0, 10.0, 0.5, 3.0,
                                             hint="Scales heights in the 3D view only")
-            self.pt_size = g.add_slider("Point size (cm)", 0.5, 4, 0.5, 1.5)
+            self.pt_size = g.add_slider("Point size (cm)", 0.5, 4.0, 0.5, 2.0)
             self.show_ctx = g.add_checkbox("LiDAR context", True)
             self.show_all_pts = g.add_checkbox("Points of all slices", False)
             self.show_labels = g.add_checkbox("Height labels", True)
             self.show_cam = g.add_checkbox("Camera position", True)
+            self.lock_cam = g.add_checkbox("Lock camera between frames", False,
+                                           hint="Off: the view follows the car when you change frame. "
+                                                "On: the view stays fixed in the world, to compare one piece "
+                                                "of curb across frames. Key: L")
             self.btn_focus = g.add_button("Focus on selected slice")
             self.btn_cam = g.add_button("View from camera", hint="Looks through the camera (resets exaggeration to 1)")
             self.btn_clear = g.add_button("Clear picked point")
+            self.btn_recenter = g.add_button("Re-centre on this frame")
+            self.btn_help = g.add_button("Keyboard shortcuts (?)")
 
         with g.add_folder("Curb ribbons"):
             self.show_ribbons = g.add_checkbox("Show ribbons", True)
@@ -525,6 +653,8 @@ class CurbViewer:
         self.btn_focus.on_click(lambda ev: self._focus(ev.client))
         self.btn_cam.on_click(lambda ev: self._view_from_camera(ev.client))
         self.btn_clear.on_click(lambda _: self._set_pick(None))
+        self.btn_recenter.on_click(lambda ev: self._reset_camera(ev.client))
+        self.btn_help.on_click(lambda _: self.toggle_help())
 
     # ---------------- 3D scene
     def _colors(self, which):
@@ -583,10 +713,11 @@ class CurbViewer:
         back = self.fr.c2w[:3, 2].copy()
         back[2] = 0
         back /= np.linalg.norm(back) + 1e-9
+        target = self.fr.local(self.fr.center) * [1, 1, self.exag]
         with client.atomic():
             client.camera.up_direction = (0.0, 0.0, 1.0)
             client.camera.position = self.cam_pos * [1, 1, self.exag] - 6 * back + np.array([0, 0, 6.0])
-            client.camera.look_at = (0.0, 0.0, 0.0)
+            client.camera.look_at = target
 
     def _set_exag(self, e):
         with self.lock:
