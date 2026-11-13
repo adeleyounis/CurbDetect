@@ -519,12 +519,12 @@ class CurbViewer:
                 h["points"].visible = on and (selected or self.show_all_pts.value)
                 h["points"].point_size = ps
                 h["profile"].visible = on
-                h["profile"].colors = np.tile(color, (h["n_seg"], 2, 1))
+                h["profile"].colors = color  # single colour: switching to per-vertex arrays turns lines grey in viser
                 h["profile"].thickness = 9 if selected else 5
                 h["ribbon"].visible = on and self.show_ribbons.value
                 h["ribbon"].color = tuple(int(c) for c in color)
                 h["edges"].visible = on and self.show_ribbons.value
-                h["edges"].colors = np.tile(color, (2, 2, 1))
+                h["edges"].colors = color
                 h["edges"].thickness = 12 if selected else 8
                 h["anchor"].visible = on
                 h["anchor"].color = tuple(int(c) for c in color)

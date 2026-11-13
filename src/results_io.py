@@ -1,9 +1,8 @@
 """
 Save / load per-frame curb-fit results to a single .npz file.
 
-The layout matches what inspect_curb.py reads, plus a few extra keys
-(betas, centres, widths, sides, point indices ...) needed later to rebuild
-and interpolate the fitted profiles. inspect_curb.py ignores the extras.
+Global keys hold one row per successful slice (distances, anchors_3d, betas, ...).
+Per-slice point data has a variable length, so it is stored as slice_{k}_<name>.
 
 Everything is stored as plain arrays, so the file loads with allow_pickle=False.
 Units: metres everywhere, except keys ending in _cm.
@@ -94,7 +93,7 @@ def save_frame_results(path, results, cloud, vis_idx, cam_to_world, proj_matrix,
         sides.append(item.get("side") or "unknown")
         band_ids.append(results.index(item))
 
-        # per-slice ragged data (keys used by inspect_curb.py)
+        # per-slice ragged data
         cloud_idx = np.asarray(item["cloud_idx"])
         out[f"slice_{k}_xyz"] = cloud["xyz"][cloud_idx]
         out[f"slice_{k}_s"] = np.asarray(res["pts"], float)
@@ -102,7 +101,7 @@ def save_frame_results(path, results, cloud, vis_idx, cam_to_world, proj_matrix,
         out[f"slice_{k}_lab"] = np.asarray(res["lab"])
         out[f"slice_{k}_bins"] = np.column_stack(res["bins"])
         out[f"slice_{k}_fit_sz"] = np.column_stack((s, xyz[:, 2]))
-        out[f"slice_{k}_cloud_idx"] = cloud_idx  # extra: indices into the full frame cloud
+        out[f"slice_{k}_cloud_idx"] = cloud_idx  # indices into the full frame cloud
 
     anchors_3d = np.array(anchors_3d)
     out.update(
