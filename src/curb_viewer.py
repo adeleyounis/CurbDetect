@@ -2,8 +2,9 @@
 Interactive viewer for one frame's curb slices (the .npz written by results_io.save_frame_results).
 
     pip install viser plotly
-    python curb_viewer.py ../outputs/<seq>_cam0_frame000250_slices.npz
-    -> open http://localhost:8080
+    python curb_viewer.py ../outputs/slices                      # every frame in the folder
+    python curb_viewer.py ../outputs/slices/<file>.npz [more.npz]  # specific files
+    -> open http://localhost:8080   (with several files, pick one in the "Frame" dropdown)
 
 Controls
   ← / →          previous / next slice (click the 3D view first so the page has focus)
@@ -24,6 +25,7 @@ Coordinates: the 3D scene is world XYZ shifted by a local origin (the slices' me
 "Vertical exaggeration" only scales the 3D view; numbers in the panels are always true values.
 """
 import argparse
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,7 +57,7 @@ RIBBON_LENGTH = 1.0           # m along the curb (default; adjustable in the GUI
 RIBBON_MARGIN = 0.4           # m of road / sidewalk shown each side of the ramp (adjustable)
 ORB_FACTOR = 1.0              # curb-centre orb radius = ORB_FACTOR x point size
 ORB_MIN_RADIUS = 0.015        # m, so the orbs stay clickable
-LIFT = np.array([0, 0, 0.01])  # 3D only: draw ribbons/lines 2 cm above the points so they aren't hidden
+LIFT = np.array([0, 0, 0.02])  # 3D only: draw ribbons/lines 2 cm above the points so they aren't hidden
 
 
 def hexc(rgb):
@@ -383,10 +385,13 @@ def start_key_server(port, on_step):
 
 # ----------------------------------------------------------------------------- viewer
 class CurbViewer:
-    def __init__(self, fr: Frame, port=8080, key_port=None, panel_width=520):
-        self.fr = fr
+    def __init__(self, paths, port=8080, key_port=None, panel_width=520):
+        self.paths = [Path(p) for p in paths]
+        self._frames = {}                      # cache: index -> Frame (loaded on first view)
+        self.frame_i = 0
+        self.fr = self._load(0)
         self.lock = threading.RLock()
-        self.server = viser.ViserServer(port=port, label=f"curb viewer · {fr.path.name}")
+        self.server = viser.ViserServer(port=port, label="curb viewer")
         self.server.gui.configure_theme(show_share_button=False)
         # side panel docked on the right; the 3D view fills the rest. Drag its edge to resize.
         self.server.gui.main_panel.dock_right()
@@ -400,7 +405,46 @@ class CurbViewer:
         self.handles = {}
         self._build_gui()
         self._build_scene()
+        self._register_scene_callbacks()
         self.select(self.visible()[0])
+
+    # ---------------- frames
+    def _load(self, i):
+        if i not in self._frames:
+            self._frames[i] = Frame(self.paths[i])
+        return self._frames[i]
+
+    def _header(self):
+        fr = self.fr
+        return (f"**{fr.meta['seq']}** · frame **{int(fr.meta['frame'])}** · {fr.K} slices "
+                f"({int(np.isnan(fr.meta['all_heights_cm']).sum())} failed bands)")
+
+    def switch_frame(self, i):
+        """Replace the whole scene and all panels with another .npz from the list."""
+        with self.lock:
+            if i == self.frame_i:
+                return
+            # remove the old frame's 3D nodes (children first, then the parent frame)
+            for key, h in self.handles.items():
+                for node in (h.values() if isinstance(h, dict) else [h]):
+                    if hasattr(node, "remove"):
+                        node.remove()
+            self.world.remove()
+            self.handles = {}
+            self.frame_i = i
+            self.fr = self._load(i)
+            self.fr.set_ribbon_params(self.rib_len.value, self.rib_margin.value / 100, self.rib_extent.value)
+            self.pick = None
+            self.pick_info.content = ""
+            self._build_scene()
+            self._switching = True             # ignore the dropdown's on_update while we refill it
+            self.slice_dd.options = [self.fr.describe(k) for k in range(self.fr.K)]
+            self._switching = False
+            self.header.content = self._header()
+            self.sel = -1
+            self.select(self.visible()[0])
+            for client in self.server.get_clients().values():
+                self._reset_camera(client)
 
     def visible(self):
         f = self.side_filter.value.lower()
@@ -410,8 +454,18 @@ class CurbViewer:
     # ---------------- GUI
     def _build_gui(self):
         g, fr = self.server.gui, self.fr
-        g.add_markdown(f"**{fr.meta['seq']}** · frame **{int(fr.meta['frame'])}** · {fr.K} slices "
-                       f"({int(np.isnan(fr.meta['all_heights_cm']).sum())} failed bands)")
+        self._switching = False
+        if len(self.paths) > 1:
+            self.frame_dd = g.add_dropdown("Frame", [frame_label(p) for p in self.paths],
+                                           hint=f"{len(self.paths)} files; each is loaded the first time you open it")
+            self.frame_dd.on_update(lambda _: self.switch_frame(self.frame_dd.options.index(self.frame_dd.value)))
+        self.header = g.add_markdown(self._header())
+
+        with g.add_folder("Photo"):
+            blank = np.zeros((10, 10, 3), np.uint8)
+            self.img_full = g.add_image(blank, label="camera (selected = magenta)", format="jpeg", jpeg_quality=88)
+            self.img_zoom = g.add_image(blank, label="zoom on selected slice", format="jpeg", jpeg_quality=92)
+
 
         with g.add_folder("Slice"):
             self.side_filter = g.add_dropdown("Curb side", ["Both", "Left", "Right"])
@@ -427,11 +481,6 @@ class CurbViewer:
             self.info = g.add_markdown("")
             self.pick_info = g.add_markdown("")
 
-        with g.add_folder("Photo"):
-            blank = np.zeros((10, 10, 3), np.uint8)
-            self.img_full = g.add_image(blank, label="camera (selected = magenta)", format="jpeg", jpeg_quality=88)
-            self.img_zoom = g.add_image(blank, label="zoom on selected slice", format="jpeg", jpeg_quality=92)
-
         with g.add_folder("Cross-section"):
             self.xsec = g.add_plotly(go.Figure(), aspect=1.6)
 
@@ -444,7 +493,7 @@ class CurbViewer:
                            f"green → yellow ≥ {HEIGHT_RANGE[1] * 100:.0f} cm</small>")
             self.exag_slider = g.add_slider("Vertical exaggeration", 1.0, 10.0, 0.5, 3.0,
                                             hint="Scales heights in the 3D view only")
-            self.pt_size = g.add_slider("Point size (cm)", 0.5, 3.0, 0.5, 1.5)
+            self.pt_size = g.add_slider("Point size (cm)", 0.5, 4, 0.5, 1.5)
             self.show_ctx = g.add_checkbox("LiDAR context", True)
             self.show_all_pts = g.add_checkbox("Points of all slices", False)
             self.show_labels = g.add_checkbox("Height labels", True)
@@ -463,7 +512,8 @@ class CurbViewer:
                                            hint="How much flat road and sidewalk to show each side of the ramp")
 
         self.side_filter.on_update(lambda _: self.select(self.sel if self.sel in self.visible() else self.visible()[0]))
-        self.slice_dd.on_update(lambda _: (k := self.slice_dd.options.index(self.slice_dd.value)) != self.sel
+        self.slice_dd.on_update(lambda _: not self._switching
+                                and (k := self.slice_dd.options.index(self.slice_dd.value)) != self.sel
                                 and self.select(k))
         self.exag_slider.on_update(lambda _: self._set_exag(self.exag_slider.value))
         self.color_mode.on_update(lambda _: self._recolor())
@@ -518,21 +568,25 @@ class CurbViewer:
             "/camera", fov=self.cam_fov, aspect=fr.W / fr.H, scale=0.4, wxyz=self.cam_wxyz,
             position=self.cam_pos, color=(30, 30, 30), thickness=3, thickness_units="screen")
 
-        @sc.on_click(modifier="shift")
+        self._set_exag(self.exag_slider.value)
+
+    def _register_scene_callbacks(self):
+        """Registered once; they always act on the current frame (self.fr)."""
+        @self.server.scene.on_click(modifier="shift")
         def _(ev):
             self._pick_from_ray(np.asarray(ev.ray_origin), np.asarray(ev.ray_direction))
 
-        @self.server.on_client_connect
-        def _(client):
-            back = fr.c2w[:3, 2].copy()
-            back[2] = 0
-            back /= np.linalg.norm(back) + 1e-9
-            with client.atomic():
-                client.camera.up_direction = (0.0, 0.0, 1.0)
-                client.camera.position = self.cam_pos * [1, 1, self.exag] - 6 * back + np.array([0, 0, 6.0])
-                client.camera.look_at = (0.0, 0.0, 0.0)
+        self.server.on_client_connect(self._reset_camera)
 
-        self._set_exag(self.exag_slider.value)
+    def _reset_camera(self, client):
+        """Start view: behind and above the car, looking at the slices."""
+        back = self.fr.c2w[:3, 2].copy()
+        back[2] = 0
+        back /= np.linalg.norm(back) + 1e-9
+        with client.atomic():
+            client.camera.up_direction = (0.0, 0.0, 1.0)
+            client.camera.position = self.cam_pos * [1, 1, self.exag] - 6 * back + np.array([0, 0, 6.0])
+            client.camera.look_at = (0.0, 0.0, 0.0)
 
     def _set_exag(self, e):
         with self.lock:
@@ -689,14 +743,38 @@ class CurbViewer:
         self.server.sleep_forever()
 
 
+def frame_label(path):
+    """'..._drive_0000_sync_cam0_frame000325_slices.npz' -> 'drive_0000 · frame 325'."""
+    name = Path(path).name
+    drive, frame = re.search(r"drive_\d+", name), re.search(r"frame(\d+)", name)
+    if not frame:
+        return Path(path).stem
+    return (f"{drive.group(0)} · " if drive else "") + f"frame {int(frame.group(1))}"
+
+
+def collect_npz(inputs):
+    """Files and/or folders -> sorted list of *_slices.npz paths (sorted by drive, then frame)."""
+    paths = []
+    for p in map(Path, inputs):
+        paths += sorted(p.glob("*_slices.npz")) if p.is_dir() else [p]
+    def key(p):
+        drive, frame = re.search(r"drive_\d+", p.name), re.search(r"frame(\d+)", p.name)
+        return (drive.group(0) if drive else "", int(frame.group(1)) if frame else 0, p.name)
+    paths = sorted(dict.fromkeys(paths), key=key)
+    if not paths:
+        raise SystemExit(f"No *_slices.npz files found in {inputs}")
+    return paths
+
+
 def main():
     ap = argparse.ArgumentParser(description="Interactive viewer for curb slice results (.npz).")
-    ap.add_argument("npz", type=Path)
+    ap.add_argument("npz", nargs="+", type=Path,
+                    help="one or more .npz files and/or folders of them (e.g. ../outputs/slices)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--key-port", type=int, default=None, help="port for arrow-key events (default: port+1)")
     ap.add_argument("--panel-width", type=int, default=520, help="initial side panel width in px (drag to resize)")
     args = ap.parse_args()
-    CurbViewer(Frame(args.npz), port=args.port, key_port=args.key_port, panel_width=args.panel_width).run()
+    CurbViewer(collect_npz(args.npz), port=args.port, key_port=args.key_port, panel_width=args.panel_width).run()
 
 
 if __name__ == "__main__":
