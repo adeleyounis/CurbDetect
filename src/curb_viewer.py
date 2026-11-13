@@ -13,9 +13,12 @@ Controls
 
 3D view
   * points are coloured by height above the local road surface (or by road/sidewalk label),
-  * each slice has a "curb ribbon": its fitted profile extruded a short way along the curb,
-    with the bottom and top edges of the curb drawn as lines,
+  * each slice has a "curb ribbon": its fitted profile extruded along the curb, with the bottom
+    and top edges of the curb drawn as lines. Length and margin are adjustable ("Curb ribbons"),
+    or the ribbon can span the along-curb range the slice's points actually cover,
   * the same ribbons and edges are drawn on the photo, so you can match 3D and image.
+
+The side panel is docked on the right (drag its edge to resize; --panel-width sets the start width).
 
 Coordinates: the 3D scene is world XYZ shifted by a local origin (the slices' mean), in metres.
 "Vertical exaggeration" only scales the 3D view; numbers in the panels are always true values.
@@ -48,8 +51,10 @@ OUTLINE = (0, 0, 0)
 HEIGHT_RANGE = (-0.03, 0.22)  # m, colour scale for "height above road"
 HEIGHT_CMAP = matplotlib.colormaps["viridis"]
 
-RIBBON_HALF_LENGTH = 0.5      # m along the curb, each side of the slice
-RIBBON_MARGIN = 0.4           # m of road / sidewalk shown each side of the ramp
+RIBBON_LENGTH = 1.0           # m along the curb (default; adjustable in the GUI)
+RIBBON_MARGIN = 0.4           # m of road / sidewalk shown each side of the ramp (adjustable)
+ORB_FACTOR = 1.0              # curb-centre orb radius = ORB_FACTOR x point size
+ORB_MIN_RADIUS = 0.015        # m, so the orbs stay clickable
 LIFT = np.array([0, 0, 0.02])  # 3D only: draw ribbons/lines 2 cm above the points so they aren't hidden
 
 
@@ -92,6 +97,8 @@ class Frame:
 
         anchors = np.array([s["anchor_3d"] for s in self.slices])
         self.origin = np.r_[anchors[:, :2].mean(0), np.median(anchors[:, 2])]
+
+        self.ribbon_length, self.ribbon_margin, self.ribbon_data_extent = RIBBON_LENGTH, RIBBON_MARGIN, False
 
         self.ctx_xyz = np.asarray(m["context_xyz"], float)
         self.ctx_lab = np.asarray(m["context_lab"])
@@ -138,18 +145,40 @@ class Frame:
         xyz = np.atleast_2d(xyz)
         return xyz[:, 2] - self.road_level(xyz[:, :2])
 
+    def set_ribbon_params(self, length=None, margin=None, data_extent=None):
+        if length is not None:
+            self.ribbon_length = float(length)
+        if margin is not None:
+            self.ribbon_margin = float(margin)
+        if data_extent is not None:
+            self.ribbon_data_extent = bool(data_extent)
+        for s in self.slices:
+            self._build_ribbon(s)
+
     def _build_ribbon(self, s, n=40):
+        """Fitted profile extruded along the curb.
+
+        Across the curb: the fitted ramp (c +- w/2) plus `ribbon_margin` of road/sidewalk.
+        Along the curb: `ribbon_length` centred on the slice line, or (data extent mode)
+        the along-curb range actually covered by the slice's points (2nd-98th percentile).
+        """
         fit = s["fit"]
         c, w, beta = fit["c"], fit["width"], fit["beta"]
-        lo = max(c - w / 2 - RIBBON_MARGIN, s["s"].min())
-        hi = min(c + w / 2 + RIBBON_MARGIN, s["s"].max())
+        lo = max(c - w / 2 - self.ribbon_margin, s["s"].min())
+        hi = min(c + w / 2 + self.ribbon_margin, s["s"].max())
         ss = np.linspace(lo, hi, n)
         zz = analyze_boundary.design_matrix(ss, c, w) @ beta
         nrm = np.asarray(s["normal"], float)
         tan = np.array([-nrm[1], nrm[0]])
+        if self.ribbon_data_extent:
+            along = (s["xyz"][:, :2] - np.asarray(s["mean"])) @ tan
+            a0, a1 = np.percentile(along, [2, 98])
+        else:
+            a0, a1 = -self.ribbon_length / 2, self.ribbon_length / 2
+        s["ribbon_along"] = (a0, a1)
         base = np.asarray(s["mean"], float) + ss[:, None] * nrm
-        A = np.column_stack((base - RIBBON_HALF_LENGTH * tan, zz))
-        B = np.column_stack((base + RIBBON_HALF_LENGTH * tan, zz))
+        A = np.column_stack((base + a0 * tan, zz))
+        B = np.column_stack((base + a1 * tan, zz))
         s["ribbon_verts"] = np.vstack((A, B))
         f = [(i, i + 1, n + i) for i in range(n - 1)] + [(i + 1, n + i + 1, n + i) for i in range(n - 1)]
         s["ribbon_faces"] = np.array(f, np.uint32)
@@ -158,7 +187,7 @@ class Frame:
         for se in (c - w / 2, c + w / 2):
             z = analyze_boundary.design_matrix(np.array([se]), c, w) @ beta
             p = np.asarray(s["mean"]) + se * nrm
-            edges.append(np.array([np.r_[p - RIBBON_HALF_LENGTH * tan, z], np.r_[p + RIBBON_HALF_LENGTH * tan, z]]))
+            edges.append(np.array([np.r_[p + a0 * tan, z], np.r_[p + a1 * tan, z]]))
         s["edges_xyz"] = np.array(edges)                             # (2, 2, 3)
         s["uv_ribbon"] = self.to_uv(np.vstack((A, B[::-1])))         # outline polygon
         s["uv_edges"] = [self.to_uv(e) for e in edges]
@@ -350,11 +379,14 @@ def start_key_server(port, on_step):
 
 # ----------------------------------------------------------------------------- viewer
 class CurbViewer:
-    def __init__(self, fr: Frame, port=8080, key_port=None):
+    def __init__(self, fr: Frame, port=8080, key_port=None, panel_width=520):
         self.fr = fr
         self.lock = threading.RLock()
         self.server = viser.ViserServer(port=port, label=f"curb viewer · {fr.path.name}")
-        self.server.gui.configure_theme(control_width="large", show_share_button=False)
+        self.server.gui.configure_theme(show_share_button=False)
+        # side panel docked on the right; the 3D view fills the rest. Drag its edge to resize.
+        self.server.gui.main_panel.dock_right()
+        self.server.gui.main_panel.set_width(panel_width)
         self.server.scene.set_up_direction("+z")
         self.key_port = key_port or port + 1
         self.key_server = start_key_server(self.key_port, self.step)
@@ -411,12 +443,20 @@ class CurbViewer:
             self.pt_size = g.add_slider("Point size (cm)", 0.5, 8.0, 0.5, 3.0)
             self.show_ctx = g.add_checkbox("LiDAR context", True)
             self.show_all_pts = g.add_checkbox("Points of all slices", False)
-            self.show_ribbons = g.add_checkbox("Curb ribbons", True)
             self.show_labels = g.add_checkbox("Height labels", True)
             self.show_cam = g.add_checkbox("Camera position", True)
             self.btn_focus = g.add_button("Focus on selected slice")
             self.btn_cam = g.add_button("View from camera", hint="Looks through the camera (resets exaggeration to 1)")
             self.btn_clear = g.add_button("Clear picked point")
+
+        with g.add_folder("Curb ribbons"):
+            self.show_ribbons = g.add_checkbox("Show ribbons", True)
+            self.rib_extent = g.add_checkbox("Length = data extent", False,
+                                             hint="Span the along-curb range covered by the slice's points "
+                                                  "(how much curb the fit really averages over)")
+            self.rib_len = g.add_slider("Length along curb (m)", 0.2, 6.0, 0.1, RIBBON_LENGTH)
+            self.rib_margin = g.add_slider("Road/sidewalk margin (cm)", 0, 150, 5, RIBBON_MARGIN * 100,
+                                           hint="How much flat road and sidewalk to show each side of the ramp")
 
         self.side_filter.on_update(lambda _: self.select(self.sel if self.sel in self.visible() else self.visible()[0]))
         self.slice_dd.on_update(lambda _: (k := self.slice_dd.options.index(self.slice_dd.value)) != self.sel
@@ -426,6 +466,8 @@ class CurbViewer:
         self.pt_size.on_update(lambda _: self._refresh_scene())
         for cb in (self.show_ctx, self.show_all_pts, self.show_ribbons, self.show_labels, self.show_cam):
             cb.on_update(lambda _: self._refresh_scene())
+        for ctl in (self.rib_len, self.rib_margin, self.rib_extent):
+            ctl.on_update(lambda _: self._rebuild_ribbons())
         self.btn_focus.on_click(lambda ev: self._focus(ev.client))
         self.btn_cam.on_click(lambda ev: self._view_from_camera(ev.client))
         self.btn_clear.on_click(lambda _: self._set_pick(None))
@@ -454,20 +496,15 @@ class CurbViewer:
             curve = fr.local(s["curve_xyz"]) + LIFT
             prof = sc.add_line_segments(f"/world/slice_{k}/profile", np.stack([curve[:-1], curve[1:]], 1),
                                         col, thickness=5, thickness_units="screen")
-            ribbon = sc.add_mesh_simple(f"/world/slice_{k}/ribbon", fr.local(s["ribbon_verts"]) + LIFT, s["ribbon_faces"],
-                                        color=col, opacity=0.85, side="double", flat_shading=False)
-            ribbon.on_click(lambda _, k=k: self.select(k))
-            edges = sc.add_line_segments(f"/world/slice_{k}/edges", fr.local(s["edges_xyz"]) + LIFT, col,
-                                         thickness=8, thickness_units="screen")
-            anchor = sc.add_icosphere(f"/world/slice_{k}/anchor", radius=0.07, color=col,
-                                      position=fr.local(s["anchor_3d"]))
+            anchor = sc.add_icosphere(f"/world/slice_{k}/anchor", radius=1.0, color=col,
+                                      position=fr.local(s["anchor_3d"]))  # scaled in _refresh_scene
             anchor.on_click(lambda _, k=k: self.select(k))
             lab = sc.add_label(f"/world/slice_{k}/label", f"{k}: {s['step_cm']:.1f} cm",
                                position=fr.local(s["anchor_3d"]) + [0, 0, 0.3], anchor="bottom-center")
-            self.handles[k] = dict(points=pts, profile=prof, ribbon=ribbon, edges=edges, anchor=anchor,
-                                   label=lab, n_seg=len(curve) - 1)
+            self.handles[k] = dict(points=pts, profile=prof, anchor=anchor, label=lab, n_seg=len(curve) - 1)
+            self._add_ribbon(k)
 
-        self.handles["pick"] = sc.add_icosphere("/world/pick", radius=0.06, color=PICK, visible=False)
+        self.handles["pick"] = sc.add_icosphere("/world/pick", radius=1.0, color=PICK, visible=False)
 
         # camera position only (wireframe frustum, no image)
         self.cam_fov = 2 * np.arctan2(fr.H / 2, fr.P[1, 1])
@@ -498,6 +535,38 @@ class CurbViewer:
             self.exag = float(e)
             self.world.scale = (1.0, 1.0, self.exag)
             self.handles["cam"].position = self.cam_pos * [1, 1, self.exag]
+            self._scale_orbs()
+
+    def _orb_scale(self, factor=1.0):
+        r = max(ORB_FACTOR * self.pt_size.value / 100, ORB_MIN_RADIUS) * factor
+        return (r, r, r / self.exag)  # undo the vertical exaggeration so orbs stay round
+
+    def _scale_orbs(self):
+        for k in range(self.fr.K):
+            self.handles[k]["anchor"].scale = self._orb_scale()
+        self.handles["pick"].scale = self._orb_scale(1.2)
+
+    def _add_ribbon(self, k):
+        """(Re)create slice k's ribbon mesh and curb-edge lines from the Frame's current geometry."""
+        sc, s, h = self.server.scene, self.fr.slices[k], self.handles[k]
+        for key in ("ribbon", "edges"):
+            if key in h:
+                h[key].remove()
+        col = SIDE_COLOR[s["side"]]
+        h["ribbon"] = sc.add_mesh_simple(f"/world/slice_{k}/ribbon", self.fr.local(s["ribbon_verts"]) + LIFT,
+                                         s["ribbon_faces"], color=col, opacity=0.85, side="double")
+        h["ribbon"].on_click(lambda _, k=k: self.select(k))
+        h["edges"] = sc.add_line_segments(f"/world/slice_{k}/edges", self.fr.local(s["edges_xyz"]) + LIFT, col,
+                                          thickness=8, thickness_units="screen")
+
+    def _rebuild_ribbons(self):
+        with self.lock:
+            self.rib_len.disabled = self.rib_extent.value
+            self.fr.set_ribbon_params(self.rib_len.value, self.rib_margin.value / 100, self.rib_extent.value)
+            for k in range(self.fr.K):
+                self._add_ribbon(k)
+            self._refresh_scene()
+            self._render_photo()
 
     def _recolor(self):
         with self.lock:
@@ -512,6 +581,7 @@ class CurbViewer:
             self.handles["ctx"].visible = self.show_ctx.value
             self.handles["ctx"].point_size = ps * 0.8
             self.handles["cam"].visible = self.show_cam.value
+            self.handles["pick"].scale = self._orb_scale(1.2)
             for k, s in enumerate(self.fr.slices):
                 h = self.handles[k]
                 on, selected = k in vis, k == self.sel
@@ -528,6 +598,7 @@ class CurbViewer:
                 h["edges"].thickness = 12 if selected else 8
                 h["anchor"].visible = on
                 h["anchor"].color = tuple(int(c) for c in color)
+                h["anchor"].scale = self._orb_scale(1.3 if selected else 1.0)
                 h["label"].visible = on and (self.show_labels.value or selected)
 
     # ---------------- picking
@@ -619,8 +690,9 @@ def main():
     ap.add_argument("npz", type=Path)
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--key-port", type=int, default=None, help="port for arrow-key events (default: port+1)")
+    ap.add_argument("--panel-width", type=int, default=520, help="initial side panel width in px (drag to resize)")
     args = ap.parse_args()
-    CurbViewer(Frame(args.npz), port=args.port, key_port=args.key_port).run()
+    CurbViewer(Frame(args.npz), port=args.port, key_port=args.key_port, panel_width=args.panel_width).run()
 
 
 if __name__ == "__main__":
