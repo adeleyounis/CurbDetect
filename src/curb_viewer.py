@@ -55,7 +55,7 @@ RIBBON_LENGTH = 1.0           # m along the curb (default; adjustable in the GUI
 RIBBON_MARGIN = 0.4           # m of road / sidewalk shown each side of the ramp (adjustable)
 ORB_FACTOR = 1.0              # curb-centre orb radius = ORB_FACTOR x point size
 ORB_MIN_RADIUS = 0.015        # m, so the orbs stay clickable
-LIFT = np.array([0, 0, 0.02])  # 3D only: draw ribbons/lines 2 cm above the points so they aren't hidden
+LIFT = np.array([0, 0, 0.01])  # 3D only: draw ribbons/lines 2 cm above the points so they aren't hidden
 
 
 def hexc(rgb):
@@ -166,7 +166,11 @@ class Frame:
         c, w, beta = fit["c"], fit["width"], fit["beta"]
         lo = max(c - w / 2 - self.ribbon_margin, s["s"].min())
         hi = min(c + w / 2 + self.ribbon_margin, s["s"].max())
-        ss = np.linspace(lo, hi, n)
+        # always include the ramp's start/end exactly, otherwise the corners get cut and the step looks
+        # slanted (the wider the margin, the coarser the sampling, the worse it got)
+        kinks = np.array([c - w / 2, c + w / 2])
+        ss = np.unique(np.r_[np.linspace(lo, hi, n), kinks[(kinks > lo) & (kinks < hi)]])
+        n = len(ss)
         zz = analyze_boundary.design_matrix(ss, c, w) @ beta
         nrm = np.asarray(s["normal"], float)
         tan = np.array([-nrm[1], nrm[0]])
@@ -440,7 +444,7 @@ class CurbViewer:
                            f"green → yellow ≥ {HEIGHT_RANGE[1] * 100:.0f} cm</small>")
             self.exag_slider = g.add_slider("Vertical exaggeration", 1.0, 10.0, 0.5, 3.0,
                                             hint="Scales heights in the 3D view only")
-            self.pt_size = g.add_slider("Point size (cm)", 0.5, 8.0, 0.5, 3.0)
+            self.pt_size = g.add_slider("Point size (cm)", 0.5, 3.0, 0.5, 1.5)
             self.show_ctx = g.add_checkbox("LiDAR context", True)
             self.show_all_pts = g.add_checkbox("Points of all slices", False)
             self.show_labels = g.add_checkbox("Height labels", True)
